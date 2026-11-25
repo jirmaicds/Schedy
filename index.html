@@ -89,13 +89,13 @@ body.auth-locked .ticker,body.auth-locked .masthead,body.auth-locked .controls,b
     <p class="auth-sub" id="authSub">Enter your username and PIN to continue.</p>
     <form id="authForm" novalidate>
       <label class="auth-field">Username <input id="authUser" type="text" autocomplete="username" spellcheck="false" maxlength="24" placeholder="Username"></label>
-      <label class="auth-field">PIN <input id="authPin" type="password" autocomplete="current-password" maxlength="12" placeholder="6–12 letters or numbers"></label>
+      <label class="auth-field">PIN <input id="authPin" type="password" autocomplete="current-password" maxlength="12" placeholder="4–12 letters or numbers"></label>
       <label class="auth-field" id="authConfirmWrap" hidden>Confirm PIN <input id="authConfirm" type="password" autocomplete="new-password" maxlength="12" placeholder="Type it again"></label>
       <p class="auth-error" id="authError" role="alert" hidden></p>
       <div class="auth-actions"><button class="btn primary" id="authSubmit" type="submit">Unlock →</button></div>
     </form>
     <button class="auth-link" type="button" id="authReset" hidden>Use a different username</button>
-    <p class="auth-hint">No Gmail or email needed. Your PIN can contain letters (A–Z) and numbers (0–9). Save your PIN — it can’t be recovered by email.</p>
+    <p class="auth-hint">No email needed. Your PIN can contain letters (A–Z) and numbers (0–9), 4–12 characters. It is stored as a salted hash, not plain text, and can’t be recovered — save it somewhere safe.</p>
   </div>
 </div>
 <div class="ticker" aria-hidden="true"><div class="ticker-track" id="tickerTrack"><span id="tk1"></span><span id="tk2"></span></div></div>
@@ -356,8 +356,16 @@ const fmt12=t=>{let[h,m]=t.split(':').map(Number);const ap=h>=12?'PM':'AM';h=h%1
 const emptySchedule=()=>Object.fromEntries(DAYS.map(d=>[d,[]]));
 const loadJSON=(k,f)=>{try{const v=JSON.parse(localStorage.getItem(k));return v??f}catch(e){return f}};
   let _pyLoaded=false;
-  let supabaseClient=null,currentAuthUser=null,currentAuthName='',cloudReady=false,cloudApplying=false,lastCloudStamp='',cloudChannel=null;
+  let supabaseClient=null,currentAuthUser=null,currentAuthName='',authToken='';
+  let cloudReady=false,cloudApplying=false,cloudLoading=false,lastCloudStamp='',lastLocalSignature='',cloudPollTimer=null;
+  const AUTH_TOKEN_KEY='bb.auth.token.v1', AUTH_NAME_KEY='bb.auth.name.v1';
+  function tokenRead(){try{return localStorage.getItem(AUTH_TOKEN_KEY)||''}catch(e){return ''}}
+  function tokenWrite(t){authToken=String(t||'');try{if(authToken)localStorage.setItem(AUTH_TOKEN_KEY,authToken);else localStorage.removeItem(AUTH_TOKEN_KEY)}catch(e){}}
+  function nameRead(){try{return sessionStorage.getItem(AUTH_NAME_KEY)||''}catch(e){return ''}}
+  function nameWrite(n){currentAuthName=String(n||'');try{if(currentAuthName)sessionStorage.setItem(AUTH_NAME_KEY,currentAuthName);else sessionStorage.removeItem(AUTH_NAME_KEY)}catch(e){}}
   function snapshotPayload(){return {week:schedule,events,cats,schoolCal,settings}}
+  function localSignature(){try{return JSON.stringify(snapshotPayload())}catch(e){return ''}}
+  function isUnauthorized(err){return /UNAUTHORIZED|invalid session/i.test(String((err&&err.message)||err||''))}
   function cacheLocally(data){
     try{
       localStorage.setItem('bb.sched',JSON.stringify(data.week||emptySchedule()));
@@ -376,59 +384,85 @@ const loadJSON=(k,f)=>{try{const v=JSON.parse(localStorage.getItem(k));return v?
     if(d.settings)Object.assign(settings,d.settings);
     _pyLoaded=true;
   }
-  async function cloudSave(){
-    if(!cloudReady||!supabaseClient||!currentAuthUser||cloudApplying)return false;
-    const stamp=new Date().toISOString();lastCloudStamp=stamp;
+  function applyRemote(d,announce){
+    const stamp=(d&&d.updatedAt)||'';
+    if(stamp&&stamp===lastCloudStamp)return false;
+    lastCloudStamp=stamp;
+    cloudApplying=true;
+    try{
+      applyLoadedData(d);cacheLocally(d);lastLocalSignature=localSignature();
+      try{render(true);setTicker(true);syncChips();updateNowMarks()}catch(e){}
+      if(announce)toast('Schedule synced from another device');
+    }finally{cloudApplying=false}
+    return true;
+  }
+  async function cloudSave(force){
+    if(!cloudReady||!supabaseClient||!authToken||cloudApplying||(!force&&cloudLoading))return false;
+    const sig=localSignature();
+    if(sig&&sig===lastLocalSignature)return false;
+    const stamp=new Date().toISOString();
     const payload=Object.assign(snapshotPayload(),{updatedAt:stamp});
     try{
-      const {error}=await supabaseClient.from('schedy_data').upsert({user_id:currentAuthUser.id,data:payload,updated_at:stamp},{onConflict:'user_id'});
-      if(error){console.warn('Supabase save failed:',error.message);return false}
+      const {error}=await supabaseClient.rpc('schedy_save',{p_token:authToken,p_data:payload});
+      if(error){
+        if(isUnauthorized(error))setTimeout(()=>authLock(),0);
+        console.warn('Supabase save failed:',error.message);return false;
+      }
+      lastCloudStamp=stamp;
+      if(localSignature()===sig)lastLocalSignature=sig;
       return true;
     }catch(e){console.warn('Supabase save failed:',e);return false}
   }
   async function pySave(){
     const data=snapshotPayload();
     await cloudSave();
-    try{await fetch('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});return}catch(e){}
+    if(/^https?:$/.test(location.protocol)){
+      try{await fetch('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});return}catch(e){}
+    }
     try{if(window.pywebview&&window.pywebview.api&&typeof window.pywebview.api.save_all==='function'){await window.pywebview.api.save_all(data)}}catch(e2){}
   }
   async function pyExport(){try{if(typeof totalClasses==='function'&&!totalClasses()&&!events.length&&!schoolCal.length){toast('No schedule yet — add classes before exporting');return;}const data={app:'BlockBoard',type:'blockboard',exported:new Date().toISOString(),week:schedule,events,cats,schoolCal};const r=await fetch('/api/export',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});if(r.ok){toast('Exported .json ✔');return;}throw new Error('x');}catch(e){try{if(window.pywebview&&window.pywebview.api&&typeof window.pywebview.api.export_json==='function'){const data={app:'BlockBoard',type:'blockboard',exported:new Date().toISOString(),week:schedule,events,cats,schoolCal};const rr=await window.pywebview.api.export_json(data);if(rr&&rr.ok){toast('Exported .json ✔');return;}}}catch(e2){}try{if(typeof exportJSON==='function')exportJSON();}catch(e3){toast('Export failed');}}}
   async function pyLoad(){
-  let d=null,cloudChecked=false;
-  if(cloudReady&&supabaseClient&&currentAuthUser){
-    try{
-      const {data:row,error}=await supabaseClient.from('schedy_data').select('data,updated_at').eq('user_id',currentAuthUser.id).maybeSingle();
-      if(!error){cloudChecked=true;if(row&&row.data){d=row.data;lastCloudStamp=(row.data&&row.data.updatedAt)||row.updated_at||''}}
-    }catch(e){}
+    let d=null,cloudChecked=false;
+    if(cloudReady&&supabaseClient&&authToken){
+      cloudLoading=true;
+      try{
+        const {data:result,error}=await supabaseClient.rpc('schedy_load',{p_token:authToken});
+        if(error){
+          if(isUnauthorized(error)){tokenWrite('');cloudReady=false;setTimeout(()=>authLock(),0)}
+        }else if(result){
+          cloudChecked=true;
+          if(result.hasRow&&result.data){d=result.data;lastCloudStamp=(d&&d.updatedAt)||'';applyLoadedData(d);lastLocalSignature=localSignature()}
+        }
+      }catch(e){console.warn('Supabase load failed:',e)}
+      finally{cloudLoading=false}
+    }
+    if(!cloudChecked){
+      try{const r=await fetch('/api/load');if(r.ok){d=await r.json()}}catch(e){}
+      if(!d&&window.pywebview&&window.pywebview.api&&typeof window.pywebview.api.load_all==='function'){try{d=await window.pywebview.api.load_all()}catch(e){}}
+      if(d&&typeof d==='object')applyLoadedData(d);
+    }
   }
-  if(!cloudChecked){
-    try{const r=await fetch('/api/load');if(r.ok){d=await r.json()}}catch(e){}
-    if(!d&&window.pywebview&&window.pywebview.api&&typeof window.pywebview.api.load_all==='function'){try{d=await window.pywebview.api.load_all()}catch(e){}}
+  function startCloudSync(){
+    if(!cloudReady||!supabaseClient||!authToken||cloudPollTimer)return;
+    const poll=async()=>{
+      if(document.body.classList.contains('auth-locked')){stopCloudSync();return}
+      if(cloudApplying||cloudLoading)return;
+      try{
+        const {data:result,error}=await supabaseClient.rpc('schedy_load',{p_token:authToken});
+        if(error){
+          if(isUnauthorized(error)){tokenWrite('');cloudReady=false;stopCloudSync();setTimeout(()=>authLock(),0)}
+          return;
+        }
+        if(result&&result.hasRow&&result.data)applyRemote(result.data,true);
+      }catch(e){}
+    };
+    cloudPollTimer=setInterval(poll,5000);
   }
-  if(d&&typeof d==='object'){
-    const hasData=Array.isArray(d.events)&&d.events.length||Array.isArray(d.schoolCal)&&d.schoolCal.length||d.week&&DAYS.some(x=>Array.isArray(d.week[x])&&d.week[x].length);
-    if(hasData||cloudChecked)applyLoadedData(d);
+  function stopCloudSync(){
+    if(!cloudPollTimer)return;
+    clearInterval(cloudPollTimer);cloudPollTimer=null;
   }
-}
-function startCloudSync(){
-  if(!cloudReady||!supabaseClient||!currentAuthUser||cloudChannel)return;
-  const uid=currentAuthUser.id;
-  cloudChannel=supabaseClient.channel('schedy-'+uid)
-    .on('postgres_changes',{event:'*',schema:'public',table:'schedy_data',filter:`user_id=eq.${uid}`},payload=>{
-      if(cloudApplying||!payload.new||!payload.new.data)return;
-      const incoming=payload.new.data,stamp=incoming.updatedAt||payload.new.updated_at||'';
-      if(stamp&&stamp===lastCloudStamp)return;
-      lastCloudStamp=stamp;cloudApplying=true;
-      applyLoadedData(incoming);cacheLocally(incoming);
-      try{render(true);setTicker(true);syncChips();updateNowMarks()}catch(e){}
-      cloudApplying=false;toast('Schedule synced from another device');
-    }).subscribe();
-}
-function stopCloudSync(){
-  if(!cloudChannel)return;
-  try{if(supabaseClient)supabaseClient.removeChannel(cloudChannel)}catch(e){}
-  cloudChannel=null;
-}
 function manilaNow(){const p=new Intl.DateTimeFormat('en-US',{timeZone:'Asia/Manila',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}).formatToParts(new Date());const g=t=>+p.find(x=>x.type===t).value;return new Date(g('year'),g('month')-1,g('day'),g('hour')%24,g('minute'),g('second'))}
 const isoOf=(y,m,d)=>`${y}-${pad(m+1)}-${pad(d)}`;
 function todayISO(){const n=manilaNow();return isoOf(n.getFullYear(),n.getMonth(),n.getDate())}
@@ -1593,56 +1627,58 @@ document.addEventListener('keydown',e=>{
   if(!$('#ovExport').hidden){$('#ovExport').hidden=true;return}
   if(!$('#ovExtract').hidden){$('#ovExtract').hidden=true;return}
 });
-/* ---------- Supabase username + PIN authentication (letters are allowed in PIN) ---------- */
-const AUTH_ATTEMPTS_KEY='bb.auth.attempts.v1', AUTH_SESSION='bb.auth.session.v1';
-const AUTH_USER_RE=/^[A-Za-z0-9_.-]{3,24}$/, AUTH_PIN_RE=/^[A-Za-z0-9]{6,12}$/;
-const AUTH_MAX_FAIL=5, AUTH_COOLDOWN=30000, AUTH_EMAIL_DOMAIN='@schedy.local';
+/* ---------- Custom username + PIN auth via Supabase RPC (no Supabase Auth, no emails) ---------- */
+const AUTH_ATTEMPTS_KEY='bb.auth.attempts.v1';
+const AUTH_USER_RE=/^[A-Za-z0-9_.-]{3,24}$/, AUTH_PIN_RE=/^[A-Za-z0-9]{4,12}$/;
+const AUTH_MAX_FAIL=5, AUTH_COOLDOWN=30000;
 let authMode='login',authBusy=false,authBooted=false;
 function authError(msg){const el=$('#authError');el.textContent=msg;el.hidden=false}
 function authClearError(){const el=$('#authError');el.textContent='';el.hidden=true}
-function authGetSession(){try{return sessionStorage.getItem(AUTH_SESSION)}catch(e){return null}}
-function authSetSession(v){try{sessionStorage.setItem(AUTH_SESSION,v)}catch(e){}}
-function authClearSession(){try{sessionStorage.removeItem(AUTH_SESSION)}catch(e){}}
 function authReadAttempts(user){try{return JSON.parse(localStorage.getItem(AUTH_ATTEMPTS_KEY+':'+user)||'{"failures":0,"until":0}')}catch(e){return {failures:0,until:0}}}
 function authWriteAttempts(user,r){try{localStorage.setItem(AUTH_ATTEMPTS_KEY+':'+user,JSON.stringify(r))}catch(e){}}
-function authNameOf(u){return (u&&u.user_metadata&&u.user_metadata.username)||((u&&u.email||'').split('@')[0])||'there'}
+function authClearAttempts(user){authWriteAttempts(user,{failures:0,until:0})}
 function authMessage(err){
   const m=String((err&&err.message)||'Wrong username or PIN.');
-  if(/invalid login credentials/i.test(m))return 'Wrong username or PIN.';
-  if(/user already registered/i.test(m))return 'That username is already taken — sign in instead.';
-  if(/password should be at least/i.test(m))return 'PIN must be at least 6 characters.';
-  if(/email not confirmed/i.test(m))return 'Email confirmation is on. Turn it off in Supabase → Authentication → Providers → Email.';
+  if(/USERNAME_TAKEN|duplicate key|unique constraint/i.test(m))return 'That username is already taken — sign in instead.';
+  if(/INVALID_CREDENTIALS/i.test(m))return 'Wrong username or PIN.';
+  if(/INVALID_USERNAME/i.test(m))return 'Username must be 3–24 letters, numbers, dot, dash or underscore.';
+  if(/INVALID_PIN/i.test(m))return 'PIN must be 4–12 characters — letters and numbers are both allowed.';
+  if(/UNAUTHORIZED|invalid session/i.test(m))return 'Session expired. Please sign in again.';
+  if(/permission denied|does not exist|function public\.schedy_/i.test(m))return 'Supabase setup is incomplete. Run supabase-setup.sql in the SQL Editor.';
   return m;
 }
 function authRenderMode(){
-  const signup=authMode==='signup',name=currentAuthName||authGetSession()||'';
+  const signup=authMode==='signup',name=currentAuthName||nameRead()||'';
   $('#authTitle').textContent=signup?'Create your account':(name?`Welcome back, ${name}`:'Unlock your schedule');
-  $('#authSub').textContent=signup?'Pick a username and a PIN. No Gmail or email required.':'Enter your username and PIN to continue.';
+  $('#authSub').textContent=signup?'Pick a username and a PIN. No email or Gmail required.':'Enter your username and PIN to continue.';
   $('#authConfirmWrap').hidden=!signup;
   $('#authSubmit').textContent=signup?'Create account →':'Unlock →';
   $('#authReset').hidden=false;
-  $('#authReset').textContent=signup?'Already have an account? Sign in':'Use a different username';
+  $('#authReset').textContent=signup?'Already have an account? Sign in':'New here? Create an account';
   $('#authPin').autocomplete=signup?'new-password':'current-password';
   authClearError();
 }
 async function authFail(user,err){
-  const r=authReadAttempts(user.toLowerCase());r.failures=(r.failures||0)+1;
-  if(r.failures>=AUTH_MAX_FAIL){r.until=Date.now()+AUTH_COOLDOWN;r.failures=0;authWriteAttempts(user.toLowerCase(),r);authError(`Too many attempts. Try again in ${AUTH_COOLDOWN/1000} seconds.`)}
-  else{authWriteAttempts(user.toLowerCase(),r);authError(`${authMessage(err)} · ${AUTH_MAX_FAIL-r.failures} attempt(s) left.`)}
+  const key=user.toLowerCase(),r=authReadAttempts(key);r.failures=(r.failures||0)+1;
+  if(r.failures>=AUTH_MAX_FAIL){r.until=Date.now()+AUTH_COOLDOWN;r.failures=0;authWriteAttempts(key,r);authError(`Too many attempts. Try again in ${AUTH_COOLDOWN/1000} seconds.`)}
+  else{authWriteAttempts(key,r);authError(`${authMessage(err)} · ${AUTH_MAX_FAIL-r.failures} attempt(s) left.`)}
 }
-function authUnlock(name){
-  currentAuthName=String(name);authSetSession(currentAuthName);
+function authUnlock(name,account){
+  nameWrite(name);
+  if(account){currentAuthUser=account;cloudReady=true;lastCloudStamp=''}
   document.body.classList.remove('auth-locked');
   $('#authScreen').hidden=true;$('#btnLogout').hidden=false;
   $('#authPin').value='';$('#authConfirm').value='';authClearError();
-  if(!authBooted){authBooted=true;bootApp()}else{try{render(false)}catch(e){}}
+  if(!authBooted){authBooted=true;bootApp()}
+  else{(async()=>{await pyLoad();try{render(true);setTicker(true);updateNowMarks()}catch(e){}})()}
   startCloudSync();
 }
 async function authLock(){
   stopCloudSync();
-  if(supabaseClient){try{await supabaseClient.auth.signOut()}catch(e){}}
-  currentAuthUser=null;currentAuthName='';cloudReady=false;
-  authClearSession();
+  const t=authToken||tokenRead();
+  if(t&&supabaseClient){try{await supabaseClient.rpc('schedy_logout',{p_token:t})}catch(e){}}
+  tokenWrite('');nameWrite('');
+  currentAuthUser=null;currentAuthName='';cloudReady=false;cloudApplying=false;lastCloudStamp='';lastLocalSignature='';
   document.body.classList.add('auth-locked');
   $('#authScreen').hidden=false;$('#btnLogout').hidden=true;
   try{closeOverlays()}catch(e){}
@@ -1653,30 +1689,31 @@ async function authLock(){
 }
 $('#authForm').addEventListener('submit',async e=>{
   e.preventDefault();if(authBusy)return;
-  if(!supabaseClient){authError('Supabase is not configured. Open supabase-config.js.');return}
+  if(!supabaseClient){authError('Supabase is not configured. Set it in Vercel env vars or supabase-config.js.');return}
   const user=$('#authUser').value.trim(),pin=$('#authPin').value,confirm=$('#authConfirm').value;
   if(!AUTH_USER_RE.test(user)){authError('Username: 3–24 letters, numbers, dot, dash or underscore. No email addresses.');return}
-  if(!AUTH_PIN_RE.test(pin)){authError('PIN must be 6–12 characters — letters and numbers are both allowed.');return}
+  if(!AUTH_PIN_RE.test(pin)){authError('PIN must be 4–12 characters — letters and numbers are both allowed.');return}
   authBusy=true;$('#authSubmit').disabled=true;authClearError();
   try{
     if(authMode==='signup'){
       if(pin!==confirm){authError('PINs do not match.');return}
-      const email=user.toLowerCase()+AUTH_EMAIL_DOMAIN;
-      const {data,error}=await supabaseClient.auth.signUp({email,password:pin,options:{data:{username:user}}});
+      const {data,error}=await supabaseClient.rpc('schedy_signup',{p_username:user,p_display_name:user,p_pin:pin});
       if(error){authError(authMessage(error));return}
-      if(!data||!data.session){authError('Account created, but confirmation is on. Disable email confirmation in Supabase → Authentication → Providers → Email, then sign in.');return}
-      currentAuthUser=data.session.user;cloudReady=true;lastCloudStamp='';
-      const r=authReadAttempts(user.toLowerCase());r.failures=0;r.until=0;authWriteAttempts(user.toLowerCase(),r);
-      authUnlock(user);await cloudSave();
+      if(!data||!data.token){authError('Signup did not return a session. Run supabase-setup.sql in the SQL Editor.');return}
+      tokenWrite(data.token);authClearAttempts(user.toLowerCase());
+      const account={id:data.id,username:data.username,displayName:data.displayName||user};
+      authUnlock(account.displayName,account);
+      await cloudSave(true);
     }else{
-      const now=Date.now(),att=authReadAttempts(user.toLowerCase());
+      const now=Date.now(),key=user.toLowerCase(),att=authReadAttempts(key);
       if(att.until&&now<att.until){authError(`Locked for another ${Math.ceil((att.until-now)/1000)}s.`);return}
-      if(att.until&&now>=att.until){att.until=0;att.failures=0;authWriteAttempts(user.toLowerCase(),att)}
-      const {data,error}=await supabaseClient.auth.signInWithPassword({email:user.toLowerCase()+AUTH_EMAIL_DOMAIN,password:pin});
+      if(att.until&&now>=att.until){att.until=0;att.failures=0;authWriteAttempts(key,att)}
+      const {data,error}=await supabaseClient.rpc('schedy_login',{p_username:user,p_pin:pin});
       if(error){await authFail(user,error);return}
-      currentAuthUser=data.user;cloudReady=true;lastCloudStamp='';
-      const r=authReadAttempts(user.toLowerCase());r.failures=0;r.until=0;authWriteAttempts(user.toLowerCase(),r);
-      authUnlock(authNameOf(data.user));
+      if(!data||!data.token){authError('Login did not return a session. Run supabase-setup.sql in the SQL Editor.');return}
+      tokenWrite(data.token);authClearAttempts(key);
+      const account={id:data.id,username:data.username,displayName:data.displayName||user};
+      authUnlock(account.displayName,account);
     }
   }catch(err){authError('Could not sign in right now. '+(err&&err.message?err.message:'Try again.'))}
   finally{authBusy=false;$('#authSubmit').disabled=false}
@@ -1705,6 +1742,7 @@ async function resolveSupabaseConfig(){
   return {url,key};
 }
 (async function initAuth(){
+  authToken=tokenRead();
   const {url,key}=await resolveSupabaseConfig();
   if(!url||!key||/YOUR|PASTE|ANON_KEY/i.test(key)||!/^https:\/\/[a-z0-9-]+\.supabase\.co\/?$/i.test(url)){
     authLock();authError('Supabase config missing. Set SUPABASE_URL and SUPABASE_ANON_KEY in Vercel, or edit supabase-config.js.');return;
@@ -1713,14 +1751,15 @@ async function resolveSupabaseConfig(){
     authLock();authError('Supabase library failed to load. Check your internet connection.');return;
   }
   try{
-    supabaseClient=window.supabase.createClient(url,key,{auth:{persistSession:true,autoRefreshToken:true,detectSessionInUrl:false}});
+    supabaseClient=window.supabase.createClient(url,key,{auth:{persistSession:false,autoRefreshToken:false,detectSessionInUrl:false}});
   }catch(e){authLock();authError('Could not start Supabase: '+(e&&e.message?e.message:'check config'));return}
+  if(!authToken){authLock();return}
   try{
-    const {data}=await supabaseClient.auth.getSession();
-    const user=data&&data.session&&data.session.user;
-    if(user){currentAuthUser=user;cloudReady=true;authUnlock(authNameOf(user))}
-    else authLock();
-  }catch(e){authLock()}
+    const {data,error}=await supabaseClient.rpc('schedy_session',{p_token:authToken});
+    if(error||!data){tokenWrite('');authLock();return}
+    const account={id:data.id,username:data.username,displayName:data.displayName||data.username};
+    authUnlock(account.displayName,account);
+  }catch(e){tokenWrite('');authLock()}
 })();
 
 </script>
