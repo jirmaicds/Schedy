@@ -5,7 +5,7 @@ a = Analysis(
     ['SchedyDesktop.py'],
     pathex=[],
     binaries=[],
-    datas=[('schedy.html', '.'), ('Schedy.ico', '.')],
+    datas=[('index.html', '.'), ('schedy.html', '.'), ('supabase-config.js', '.'), ('Schedy.ico', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

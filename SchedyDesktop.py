@@ -201,7 +201,7 @@ def main():
         user_data.mkdir(parents=True, exist_ok=True)
         webview.create_window(
             "Schedy",
-            f"http://127.0.0.1:{PORT}/schedy.html",
+            f"http://127.0.0.1:{PORT}/index.html",
             width=1280,
             height=900,
             resizable=True,
@@ -211,7 +211,7 @@ def main():
     except Exception:
         webview.create_window(
             "Schedy",
-            f"http://127.0.0.1:{PORT}/schedy.html",
+            f"http://127.0.0.1:{PORT}/index.html",
             width=1280,
             height=900,
             resizable=True,
